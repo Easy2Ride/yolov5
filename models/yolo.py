@@ -1,30 +1,29 @@
 import argparse
 import logging
-import sys
+import math
 from copy import deepcopy
 from pathlib import Path
-
-import math
-
-sys.path.append('./')  # to run '$ python *.py' files in subdirectories
-logger = logging.getLogger(__name__)
 
 import torch
 import torch.nn as nn
 
-from models.common import Conv, Bottleneck, SPP, DWConv, Focus, BottleneckCSP, Concat, NMS, autoShape
+from models.common import Conv, Bottleneck, SPP, DWConv, Focus, BottleneckCSP, Concat, Upsample2d
 from models.experimental import MixConv2d, CrossConv, C3
 from utils.general import check_anchor_order, make_divisible, check_file, set_logging
-from utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
-    select_device, copy_attr
+from utils.torch_utils import (
+    time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, select_device)
 
+logger = logging.getLogger(__name__)
+
+
+onnx_flag = True
+
+device = torch.device(device='cpu' if not torch.cuda.is_available() else 'cuda')
 
 class Detect(nn.Module):
-    stride = None  # strides computed during build
-    export = False  # onnx export
-
-    def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
+    def __init__(self, nc=80, anchors=(),  img_hw = (320, 512), ch = ()):  # detection layer
         super(Detect, self).__init__()
+        self.stride = [8, 16, 32]  # strides computed during build
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
@@ -33,33 +32,97 @@ class Detect(nn.Module):
         a = torch.tensor(anchors).float().view(self.nl, -1, 2)
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
+        self.export = False  # onnx export
+        self.ny = []
+        self.nx = []
+       
+        self.img_hw = [int(img_hw[0]), int(img_hw[1])]
+        self.grid_xy = [None] * self.nl
+        self.anchor_wh = [None] * self.nl
+        self.multiplier1 = [None] * self.nl
+        self.multiplier2 = [None] * self.nl
+        self.selector1 = [None] * self.nl
+        self.selector2 = [None] * self.nl
+        for i in range(self.nl):
+            nx = int(self.img_hw[1] / self.stride[i])
+            ny = int(self.img_hw[0] / self.stride[i])
+            self.nx.append(nx)  # number x grid points
+            self.ny.append(ny)  # number y grid points
+            self.grid[i] = self._make_grid(nx, ny).to(device)
+            self._create_fillers(i, ny, nx)
+         
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.onnx_flag = onnx_flag
+
+    def _create_fillers(self, i, nx,  ny, bs = 1, dtype = torch.half):
+        filler1 = torch.zeros((bs, self.na, ny * nx, 2), device = device, dtype = dtype)
+        filler2 = torch.zeros((bs, self.na, ny * nx, 1 + self.nc), device = device, dtype = dtype)
+        filler3 = torch.zeros((bs, self.na, ny * nx, 1), device = device, dtype = dtype)
+        filler4 = torch.ones((bs, self.na, ny * nx, 2), device = device, dtype = dtype)
+        filler5 = torch.ones((bs, self.na, ny * nx, 1 + self.nc), device = device, dtype = dtype)
+        filler6 = torch.ones((bs, self.na, ny * nx, self.nc), device = device, dtype = dtype)
+        
+        grid_xy = (0.5 * (self.grid[i] - 0.5)).view(1, 1, ny * nx, 2).repeat(bs, self.na, 1, 1).type(dtype).to(device)
+        anchor_wh = self.anchor_grid[i].view(1, self.na, 1, 2).repeat(bs, 1, ny * nx, 1).type(dtype).to(device)
+        
+        self.grid_xy[i] = torch.cat([grid_xy, filler1, filler2], dim = 3)
+        self.anchor_wh[i] = torch.cat([filler4, anchor_wh, filler5], dim = 3)
+        
+        self.multiplier1[i] = torch.cat([filler4 * 2 * self.stride[i], filler4, filler5], dim = 3) 
+        self.multiplier2[i] = torch.cat([filler4, 2 * filler4, filler5], dim = 3)
+        
+        self.selector1[i] = torch.cat([filler1, filler4, filler2], dim = 3)
+        self.selector2[i] = torch.cat([filler1, filler1, filler3, filler6], dim = 3) 
+        
 
     def forward(self, x):
         # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
-            x[i] = self.m[i](x[i])  # conv
-            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+            if self.onnx_flag:
+                bs = 1  # batch size
+                ny, nx = self.ny[i], self.nx[i]
+            else:
+                bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+                
+            x[i] = self.m[i](x[i])
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
             if not self.training:  # inference
-                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
-                    self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
-
+                if not self.onnx_flag:
+                    if self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                        self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
+                        self._create_fillers(i,  nx, ny, bs, dtype = x[i].dtype)
+                    
                 y = x[i].sigmoid()
-                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i].to(x[i].device)) * self.stride[i]  # xy
-                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-                z.append(y.view(bs, -1, self.no))
+                
+                y = y.view(bs, self.na,  ny * nx, self.no)
+                y_select1 = ((y * self.selector1[i]) * self.multiplier2[i]) ** 2
+                y = (y + self.grid_xy[i]) * self.multiplier1[i]
+                y = (y * (1 - self.selector1[i]) + y_select1) * self.anchor_wh[i]
+                
+                #y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i].to(x[i].device)) * self.stride[i]  # xy
+                #y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                
+                
+                if self.onnx_flag:
+                    y = y.view(bs, -1)
+                else:   
+                    y = y.view(bs, -1, self.no)
+                z.append(y)
 
-        return x if self.training else (torch.cat(z, 1), x)
+        if self.training:
+            return x
+        elif self.onnx_flag:
+            return torch.cat(z, 1)
+        else:
+            return (torch.cat(z, 1), x)
 
     @staticmethod
     def _make_grid(nx=20, ny=20):
         yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
-
 
 class Model(nn.Module):
     def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None):  # model, input channels, number of classes
@@ -74,7 +137,7 @@ class Model(nn.Module):
 
         # Define model
         if nc and nc != self.yaml['nc']:
-            print('Overriding model.yaml nc=%g with nc=%g' % (self.yaml['nc'], nc))
+            print('Overriding %s nc=%g with nc=%g' % (cfg, self.yaml['nc'], nc))
             self.yaml['nc'] = nc  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist, ch_out
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
@@ -83,7 +146,8 @@ class Model(nn.Module):
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):
             s = 128  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            m.stride = torch.tensor([m.img_hw[1] / x.shape[-2] for x in self.forward(torch.zeros(1, ch, m.img_hw[0], m.img_hw[1]))])  # forward
+            #m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             m.anchors /= m.stride.view(-1, 1, 1)
             check_anchor_order(m)
             self.stride = m.stride
@@ -141,7 +205,6 @@ class Model(nn.Module):
         return x
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
-        # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
         for mi, s in zip(m.m, m.stride):  # from
@@ -164,33 +227,13 @@ class Model(nn.Module):
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
         print('Fusing layers... ')
         for m in self.model.modules():
-            if type(m) is Conv and hasattr(m, 'bn'):
+            if type(m) is Conv:
                 m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatability
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.fuseforward  # update forward
         self.info()
         return self
-
-    def nms(self, mode=True):  # add or remove NMS module
-        present = type(self.model[-1]) is NMS  # last layer is NMS
-        if mode and not present:
-            print('Adding NMS... ')
-            m = NMS()  # module
-            m.f = -1  # from
-            m.i = self.model[-1].i + 1  # index
-            self.model.add_module(name='%s' % m.i, module=m)  # add
-            self.eval()
-        elif not mode and present:
-            print('Removing NMS... ')
-            self.model = self.model[:-1]  # remove
-        return self
-
-    def autoshape(self):  # add autoShape module
-        print('Adding autoShape... ')
-        m = autoShape(self)  # wrap model
-        copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
-        return m
 
     def info(self, verbose=False):  # print model information
         model_info(self, verbose)
@@ -205,6 +248,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
+        
         for j, a in enumerate(args):
             try:
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
@@ -212,7 +256,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP, C3]:
+        if m in [nn.Conv2d, Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP, C3]:
             c1, c2 = ch[f], args[0]
 
             # Normal
@@ -247,8 +291,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 args[1] = [list(range(args[1] * 2))] * len(f)
         else:
             c2 = ch[f]
-
         m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)  # module
+
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum([x.numel() for x in m_.parameters()])  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
@@ -275,6 +319,10 @@ if __name__ == '__main__':
     # Profile
     # img = torch.rand(8 if torch.cuda.is_available() else 1, 3, 640, 640).to(device)
     # y = model(img, profile=True)
+
+    # ONNX export
+    # model.model[-1].export = True
+    # torch.onnx.export(model, img, opt.cfg.replace('.yaml', '.onnx'), verbose=True, opset_version=11)
 
     # Tensorboard
     # from torch.utils.tensorboard import SummaryWriter

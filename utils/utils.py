@@ -1,15 +1,13 @@
 import glob
-import logging
 import math
 import os
-import platform
 import random
 import shutil
 import subprocess
 import time
-from contextlib import contextmanager
 from copy import copy
 from pathlib import Path
+from sys import platform
 
 import cv2
 import matplotlib
@@ -19,12 +17,15 @@ import torch
 import torch.nn as nn
 import torchvision
 import yaml
-from scipy.cluster.vq import kmeans
 from scipy.signal import butter, filtfilt
 from tqdm import tqdm
 
-from utils.torch_utils import init_seeds as init_torch_seeds
-from utils.torch_utils import is_parallel
+from . import torch_utils  #  torch_utils, google_utils
+
+#from nms import nms as nms_torch
+
+#def nms(dets, scores, iou_threshold):
+#    return nms_torch(dets[:, :4], scores, iou_threshold, 1000)[0]
 
 # Set printoptions
 torch.set_printoptions(linewidth=320, precision=5, profile='long')
@@ -35,39 +36,15 @@ matplotlib.rc('font', **{'size': 11})
 cv2.setNumThreads(0)
 
 
-@contextmanager
-def torch_distributed_zero_first(local_rank: int):
-    """
-    Decorator to make all processes in distributed training wait for each local_master to do something.
-    """
-    if local_rank not in [-1, 0]:
-        torch.distributed.barrier()
-    yield
-    if local_rank == 0:
-        torch.distributed.barrier()
-
-
-def set_logging(rank=-1):
-    logging.basicConfig(
-        format="%(message)s",
-        level=logging.INFO if rank in [-1, 0] else logging.WARN)
-
-
 def init_seeds(seed=0):
     random.seed(seed)
     np.random.seed(seed)
-    init_torch_seeds(seed=seed)
-
-
-def get_latest_run(search_dir='./runs'):
-    # Return path to most recent 'last.pt' in /runs (i.e. to --resume from)
-    last_list = glob.glob(f'{search_dir}/**/last*.pt', recursive=True)
-    return max(last_list, key=os.path.getctime) if last_list else ''
+    torch_utils.init_seeds(seed=seed)
 
 
 def check_git_status():
     # Suggest 'git pull' if repo is out of date
-    if platform.system() in ['Linux', 'Darwin'] and not os.path.isfile('/.dockerenv'):
+    if platform in ['linux', 'darwin']:
         s = subprocess.check_output('if [ -d .git ]; then git fetch && git status -uno; fi', shell=True).decode('utf-8')
         if 'Your branch is behind' in s:
             print(s[s.find('Your branch is behind'):s.find('\n\n')] + '\n')
@@ -75,7 +52,7 @@ def check_git_status():
 
 def check_img_size(img_size, s=32):
     # Verify img_size is a multiple of stride s
-    new_size = make_divisible(img_size, int(s))  # ceil gs-multiple
+    new_size = make_divisible(img_size, s)  # ceil gs-multiple
     if new_size != img_size:
         print('WARNING: --img-size %g must be multiple of max stride %g, updating to %g' % (img_size, s, new_size))
     return new_size
@@ -93,17 +70,15 @@ def check_anchors(dataset, model, thr=4.0, imgsz=640):
         r = wh[:, None] / k[None]
         x = torch.min(r, 1. / r).min(2)[0]  # ratio metric
         best = x.max(1)[0]  # best_x
-        aat = (x > 1. / thr).float().sum(1).mean()  # anchors above threshold
-        bpr = (best > 1. / thr).float().mean()  # best possible recall
-        return bpr, aat
+        return (best > 1. / thr).float().mean()  #  best possible recall
 
-    bpr, aat = metric(m.anchor_grid.clone().cpu().view(-1, 2))
-    print('anchors/target = %.2f, Best Possible Recall (BPR) = %.4f' % (aat, bpr), end='')
-    if bpr < 0.98:  # threshold to recompute
+    bpr = metric(m.anchor_grid.clone().cpu().view(-1, 2))
+    print('Best Possible Recall (BPR) = %.4f' % bpr, end='')
+    if bpr < 0.99:  # threshold to recompute
         print('. Attempting to generate improved anchors, please wait...' % bpr)
         na = m.anchor_grid.numel() // 2  # number of anchors
         new_anchors = kmean_anchors(dataset, n=na, img_size=imgsz, thr=thr, gen=1000, verbose=False)
-        new_bpr = metric(new_anchors.reshape(-1, 2))[0]
+        new_bpr = metric(new_anchors.reshape(-1, 2))
         if new_bpr > bpr:  # replace anchors
             new_anchors = torch.tensor(new_anchors, device=m.anchors.device).type_as(m.anchors)
             m.anchor_grid[:] = new_anchors.clone().view_as(m.anchor_grid)  # for inference
@@ -121,42 +96,18 @@ def check_anchor_order(m):
     da = a[-1] - a[0]  # delta a
     ds = m.stride[-1] - m.stride[0]  # delta s
     if da.sign() != ds.sign():  # same order
-        print('Reversing anchor order')
         m.anchors[:] = m.anchors.flip(0)
         m.anchor_grid[:] = m.anchor_grid.flip(0)
 
 
 def check_file(file):
-    # Search for file if not found
-    if os.path.isfile(file) or file == '':
+    # Searches for file if not found locally
+    if os.path.isfile(file):
         return file
     else:
         files = glob.glob('./**/' + file, recursive=True)  # find file
         assert len(files), 'File Not Found: %s' % file  # assert file was found
         return files[0]  # return first file if multiple found
-
-
-def check_dataset(dict):
-    # Download dataset if not found
-    val, s = dict.get('val'), dict.get('download')
-    if val and len(val):
-        val = [os.path.abspath(x) for x in (val if isinstance(val, list) else [val])]  # val path
-        if not all(os.path.exists(x) for x in val):
-            print('\nWARNING: Dataset not found, nonexistant paths: %s' % [*val])
-            if s and len(s):  # download script
-                print('Downloading %s ...' % s)
-                if s.startswith('http') and s.endswith('.zip'):  # URL
-                    f = Path(s).name  # filename
-                    if platform.system() == 'Darwin':  # avoid MacOS python requests certificate error
-                        os.system('curl -L %s -o %s' % (s, f))
-                    else:
-                        torch.hub.download_url_to_file(s, f)
-                    r = os.system('unzip -q %s -d ../ && rm %s' % (f, f))  # unzip
-                else:  # bash script
-                    r = os.system(s)
-                print('Dataset autodownload %s\n' % ('success' if r == 0 else 'failure'))  # analyze return value
-            else:
-                raise Exception('Dataset not found.')
 
 
 def make_divisible(x, divisor):
@@ -227,7 +178,7 @@ def xywh2xyxy(x):
 def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
     # Rescale coords (xyxy) from img1_shape to img0_shape
     if ratio_pad is None:  # calculate from img0_shape
-        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
+        gain = max(img1_shape) / max(img0_shape)  # gain  = old / new
         pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
     else:
         gain = ratio_pad[0][0]
@@ -340,9 +291,9 @@ def compute_ap(recall, precision):
     return ap
 
 
-def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-9):
+def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False):
     # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
-    box2 = box2.T
+    box2 = box2.t()
 
     # Get the coordinates of bounding boxes
     if x1y1x2y2:  # x1, y1, x2, y2 = box1
@@ -359,30 +310,31 @@ def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=
             (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
 
     # Union Area
-    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
-    union = w1 * h1 + w2 * h2 - inter + eps
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1
+    union = (w1 * h1 + 1e-16) + w2 * h2 - inter
 
-    iou = inter / union
+    iou = inter / union  # iou
     if GIoU or DIoU or CIoU:
         cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex (smallest enclosing box) width
         ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
-        if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
-            c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
-            rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 +
-                    (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center distance squared
+        if GIoU:  # Generalized IoU https://arxiv.org/pdf/1902.09630.pdf
+            c_area = cw * ch + 1e-16  # convex area
+            return iou - (c_area - union) / c_area  # GIoU
+        if DIoU or CIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
+            # convex diagonal squared
+            c2 = cw ** 2 + ch ** 2 + 1e-16
+            # centerpoint distance squared
+            rho2 = ((b2_x1 + b2_x2) - (b1_x1 + b1_x2)) ** 2 / 4 + ((b2_y1 + b2_y2) - (b1_y1 + b1_y2)) ** 2 / 4
             if DIoU:
                 return iou - rho2 / c2  # DIoU
             elif CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
                 v = (4 / math.pi ** 2) * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
                 with torch.no_grad():
-                    alpha = v / ((1 + eps) - iou + v)
+                    alpha = v / (1 - iou + v)
                 return iou - (rho2 / c2 + v * alpha)  # CIoU
-        else:  # GIoU https://arxiv.org/pdf/1902.09630.pdf
-            c_area = cw * ch + eps  # convex area
-            return iou - (c_area - union) / c_area  # GIoU
-    else:
-        return iou  # IoU
+
+    return iou
 
 
 def box_iou(box1, box2):
@@ -402,8 +354,8 @@ def box_iou(box1, box2):
         # box = 4xn
         return (box[2] - box[0]) * (box[3] - box[1])
 
-    area1 = box_area(box1.T)
-    area2 = box_area(box2.T)
+    area1 = box_area(box1.t())
+    area2 = box_area(box2.t())
 
     # inter(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
     inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
@@ -471,63 +423,67 @@ class BCEBlurWithLogitsLoss(nn.Module):
 
 
 def compute_loss(p, targets, model):  # predictions, targets, model
-    device = targets.device
-    lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+    ft = torch.cuda.FloatTensor if p[0].is_cuda else torch.Tensor
+    lcls, lbox, lobj = ft([0]), ft([0]), ft([0])
     tcls, tbox, indices, anchors = build_targets(p, targets, model)  # targets
     h = model.hyp  # hyperparameters
+    red = 'mean'  # Loss reduction (sum or mean)
 
     # Define criteria
-    BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([h['cls_pw']])).to(device)
-    BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([h['obj_pw']])).to(device)
+    BCEcls = nn.BCEWithLogitsLoss(pos_weight=ft([h['cls_pw']]), reduction=red)
+    BCEobj = nn.BCEWithLogitsLoss(pos_weight=ft([h['obj_pw']]), reduction=red)
 
-    # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
+    # class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
     cp, cn = smooth_BCE(eps=0.0)
 
-    # Focal loss
+    # focal loss
     g = h['fl_gamma']  # focal loss gamma
     if g > 0:
         BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
-    # Losses
-    nt = 0  # number of targets
-    np = len(p)  # number of outputs
-    balance = [4.0, 1.0, 0.4] if np == 3 else [4.0, 1.0, 0.4, 0.1]  # P3-5 or P3-6
+    # per output
+    nt = 0  # targets
     for i, pi in enumerate(p):  # layer index, layer predictions
         b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
-        tobj = torch.zeros_like(pi[..., 0], device=device)  # target obj
+        tobj = torch.zeros_like(pi[..., 0])  # target obj
 
-        n = b.shape[0]  # number of targets
-        if n:
-            nt += n  # cumulative targets
+        nb = b.shape[0]  # number of targets
+        if nb:
+            nt += nb  # cumulative targets
             ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
 
-            # Regression
+            # GIoU
             pxy = ps[:, :2].sigmoid() * 2. - 0.5
             pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
-            pbox = torch.cat((pxy, pwh), 1).to(device)  # predicted box
-            giou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # giou(prediction, target)
-            lbox += (1.0 - giou).mean()  # giou loss
+            pbox = torch.cat((pxy, pwh), 1)  # predicted box
+            giou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, GIoU=True)  # giou(prediction, target)
+            lbox += (1.0 - giou).sum() if red == 'sum' else (1.0 - giou).mean()  # giou loss
 
-            # Objectness
+            # Obj
             tobj[b, a, gj, gi] = (1.0 - model.gr) + model.gr * giou.detach().clamp(0).type(tobj.dtype)  # giou ratio
 
-            # Classification
+            # Class
             if model.nc > 1:  # cls loss (only if multiple classes)
-                t = torch.full_like(ps[:, 5:], cn, device=device)  # targets
-                t[range(n), tcls[i]] = cp
+                t = torch.full_like(ps[:, 5:], cn)  # targets
+                t[range(nb), tcls[i]] = cp
                 lcls += BCEcls(ps[:, 5:], t)  # BCE
 
             # Append targets to text file
             # with open('targets.txt', 'a') as file:
             #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
 
-        lobj += BCEobj(pi[..., 4], tobj) * balance[i]  # obj loss
+        lobj += BCEobj(pi[..., 4], tobj)  # obj loss
 
-    s = 3 / np  # output count scaling
-    lbox *= h['giou'] * s
-    lobj *= h['obj'] * s * (1.4 if np == 4 else 1.)
-    lcls *= h['cls'] * s
+    lbox *= h['giou']
+    lobj *= h['obj']
+    lcls *= h['cls']
     bs = tobj.shape[0]  # batch size
+    if red == 'sum':
+        g = 3.0  # loss gain
+        lobj *= g / bs
+        if nt:
+            lcls *= g / nt / model.nc
+            lbox *= g / nt
 
     loss = lbox + lobj + lcls
     return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
@@ -535,43 +491,42 @@ def compute_loss(p, targets, model):  # predictions, targets, model
 
 def build_targets(p, targets, model):
     # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
-    det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
+    det = model.module.model[-1] if type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel) \
+        else model.model[-1]  # Detect() module
     na, nt = det.na, targets.shape[0]  # number of anchors, targets
     tcls, tbox, indices, anch = [], [], [], []
-    gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
-    ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-    targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
+    gain = torch.ones(6, device=targets.device)  # normalized to gridspace gain
+    off = torch.tensor([[1, 0], [0, 1], [-1, 0], [0, -1]], device=targets.device).float()  # overlap offsets
+    at = torch.arange(na).view(na, 1).repeat(1, nt)  # anchor tensor, same as .repeat_interleave(nt)
 
-    g = 0.5  # bias
-    off = torch.tensor([[0, 0],
-                        [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
-                        # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
-                        ], device=targets.device).float() * g  # offsets
-
+    style = 'rect4'
     for i in range(det.nl):
         anchors = det.anchors[i]
-        gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
+        gain[2:] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
 
         # Match targets to anchors
-        t = targets * gain
+        a, t, offsets = [], targets * gain, 0
         if nt:
-            # Matches
-            r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
+            r = t[None, :, 4:6] / anchors[:, None]  # wh ratio
             j = torch.max(r, 1. / r).max(2)[0] < model.hyp['anchor_t']  # compare
-            # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
-            t = t[j]  # filter
+            # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
+            a, t = at[j], t.repeat(na, 1, 1)[j]  # filter
 
-            # Offsets
+            # overlaps
             gxy = t[:, 2:4]  # grid xy
-            gxi = gain[[2, 3]] - gxy  # inverse
-            j, k = ((gxy % 1. < g) & (gxy > 1.)).T
-            l, m = ((gxi % 1. < g) & (gxi > 1.)).T
-            j = torch.stack((torch.ones_like(j), j, k, l, m))
-            t = t.repeat((5, 1, 1))[j]
-            offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
-        else:
-            t = targets[0]
-            offsets = 0
+            z = torch.zeros_like(gxy)
+            if style == 'rect2':
+                g = 0.2  # offset
+                j, k = ((gxy % 1. < g) & (gxy > 1.)).T
+                a, t = torch.cat((a, a[j], a[k]), 0), torch.cat((t, t[j], t[k]), 0)
+                offsets = torch.cat((z, z[j] + off[0], z[k] + off[1]), 0) * g
+
+            elif style == 'rect4':
+                g = 0.5  # offset
+                j, k = ((gxy % 1. < g) & (gxy > 1.)).T
+                l, m = ((gxy % 1. > (1 - g)) & (gxy < (gain[[2, 3]] - 1.))).T
+                a, t = torch.cat((a, a[j], a[k], a[l], a[m]), 0), torch.cat((t, t[j], t[k], t[l], t[m]), 0)
+                offsets = torch.cat((z, z[j] + off[0], z[k] + off[1], z[l] + off[2], z[m] + off[3]), 0) * g
 
         # Define
         b, c = t[:, :2].long().T  # image, class
@@ -581,7 +536,6 @@ def build_targets(p, targets, model):
         gi, gj = gij.T  # grid xy indices
 
         # Append
-        a = t[:, 6].long()  # anchor indices
         indices.append((b, a, gj, gi))  # image, anchor, grid indices
         tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
         anch.append(anchors[a])  # anchors
@@ -590,12 +544,140 @@ def build_targets(p, targets, model):
     return tcls, tbox, indices, anch
 
 
+def non_max_suppression_slow(prediction, conf_thres=0.5, nms_thres=0.5):
+    """
+    Removes detections with lower object confidence score than 'conf_thres'
+    Non-Maximum Suppression to further filter detections.
+    Returns detections with shape:
+        (x1, y1, x2, y2, object_conf, class_conf, class)
+    """
+    if prediction.dtype is torch.float16:
+        prediction = prediction.float()
+    min_wh = 2  # (pixels) minimum box width and height
+
+    output = [None] * len(prediction)
+    for image_i, pred in enumerate(prediction):
+        # Experiment: Prior class size rejection
+        # x, y, w, h = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
+        # a = w * h  # area
+        # ar = w / (h + 1e-16)  # aspect ratio
+        # n = len(w)
+        # log_w, log_h, log_a, log_ar = torch.log(w), torch.log(h), torch.log(a), torch.log(ar)
+        # shape_likelihood = np.zeros((n, 60), dtype=np.float32)
+        # x = np.concatenate((log_w.reshape(-1, 1), log_h.reshape(-1, 1)), 1)
+        # from scipy.stats import multivariate_normal
+        # for c in range(60):
+        # shape_likelihood[:, c] =
+        #   multivariate_normal.pdf(x, mean=mat['class_mu'][c, :2], cov=mat['class_cov'][c, :2, :2])
+
+        # Multiply conf by class conf to get combined confidence
+        class_conf, class_pred = pred[:, 5:].max(1)
+        
+        
+        # pred[:, 4] *= class_conf #for resnet 10 comment this
+
+        # # Merge classes (optional)
+        # class_pred[(class_pred.view(-1,1) == torch.LongTensor([2, 3, 5, 6, 7]).view(1,-1)).any(1)] = 2
+        #
+        # # Remove classes (optional)
+        # pred[class_pred != 2, 4] = 0.0
+
+        # Select only suitable predictions
+        i = (pred[:, 4] > conf_thres) & (pred[:, 2:4] > min_wh).all(1) & torch.isfinite(pred).all(1)
+        pred = pred[i]
+
+        # If none are remaining => process next image
+        if len(pred) == 0:
+            continue
+
+        # Select predicted classes
+        class_conf = class_conf[i]
+        class_pred = class_pred[i].unsqueeze(1).float()
+
+        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
+        pred[:, :4] = xywh2xyxy(pred[:, :4])
+        # pred[:, 4] *= class_conf  # improves mAP from 0.549 to 0.551
+
+        # Detections ordered as (x1y1x2y2, obj_conf, class_conf, class_pred)
+        pred = torch.cat((pred[:, :5], class_conf.unsqueeze(1), class_pred), 1)
+
+        # Get detections sorted by decreasing confidence scores
+        pred = pred[(-pred[:, 4]).argsort()]
+
+        det_max = []
+        nms_style = 'MERGE'  # 'OR' (default), 'AND', 'MERGE' (experimental)
+        for c in pred[:, -1].unique():
+            dc = pred[pred[:, -1] == c]  # select class c
+            n = len(dc)
+            if n == 1:
+                det_max.append(dc)  # No NMS required if only 1 prediction
+                continue
+            elif n > 100:
+                dc = dc[:100]  # limit to first 100 boxes: https://github.com/ultralytics/yolov3/issues/117
+
+            # Non-maximum suppression
+            if nms_style == 'OR':  # default
+                # METHOD1
+                # ind = list(range(len(dc)))
+                # while len(ind):
+                # j = ind[0]
+                # det_max.append(dc[j:j + 1])  # save highest conf detection
+                # reject = (bbox_iou(dc[j], dc[ind]) > nms_thres).nonzero()
+                # [ind.pop(i) for i in reversed(reject)]
+
+                # METHOD2
+                while dc.shape[0]:
+                    det_max.append(dc[:1])  # save highest conf detection
+                    if len(dc) == 1:  # Stop if we're at the last detection
+                        break
+                    iou = bbox_iou(dc[0], dc[1:])  # iou with other boxes
+                    dc = dc[1:][iou < nms_thres]  # remove ious > threshold
+
+            elif nms_style == 'AND':  # requires overlap, single boxes erased
+                while len(dc) > 1:
+                    iou = bbox_iou(dc[0], dc[1:])  # iou with other boxes
+                    if iou.max() > 0.5:
+                        det_max.append(dc[:1])
+                    dc = dc[1:][iou < nms_thres]  # remove ious > threshold
+
+            elif nms_style == 'MERGE':  # weighted mixture box
+                while len(dc):
+                    if len(dc) == 1:
+                        det_max.append(dc)
+                        break
+                    i = bbox_iou(dc[0], dc) > nms_thres  # iou with other boxes
+                    weights = dc[i, 4:5]
+                    dc[0, :4] = (weights * dc[i, :4]).sum(0) / weights.sum()
+                    det_max.append(dc[:1])
+                    dc = dc[i == 0]
+
+            elif nms_style == 'SOFT':  # soft-NMS https://arxiv.org/abs/1704.04503
+                sigma = 0.5  # soft-nms sigma parameter
+                while len(dc):
+                    if len(dc) == 1:
+                        det_max.append(dc)
+                        break
+                    det_max.append(dc[:1])
+                    iou = bbox_iou(dc[0], dc[1:])  # iou with other boxes
+                    dc = dc[1:]
+                    dc[:, 4] *= torch.exp(-iou ** 2 / sigma)  # decay confidences
+                    # dc = dc[dc[:, 4] > nms_thres]  # new line per https://github.com/ultralytics/yolov3/issues/362
+
+        if len(det_max):
+            det_max = torch.cat(det_max)  # concatenate
+            output[image_i] = det_max[(-det_max[:, 4]).argsort()]  # sort
+
+    return output
+
+
 def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, classes=None, agnostic=False):
     """Performs Non-Maximum Suppression (NMS) on inference results
 
     Returns:
          detections with shape: nx6 (x1, y1, x2, y2, conf, cls)
     """
+    if prediction.dtype is torch.float16:
+        prediction = prediction.float()  # to FP32
 
     nc = prediction[0].shape[1] - 5  # number of classes
     xc = prediction[..., 4] > conf_thres  # candidates
@@ -626,7 +708,7 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, 
 
         # Detections matrix nx6 (xyxy, conf, cls)
         if multi_label:
-            i, j = (x[:, 5:] > conf_thres).nonzero(as_tuple=False).T
+            i, j = (x[:, 5:] > conf_thres).nonzero().t()
             x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
         else:  # best class only
             conf, j = x[:, 5:].max(1, keepdim=True)
@@ -651,6 +733,7 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, 
         # Batched NMS
         c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
         boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
+        #i = nms(boxes, scores, iou_thres) 
         i = torchvision.ops.boxes.nms(boxes, scores, iou_thres)
         if i.shape[0] > max_det:  # limit detections
             i = i[:max_det]
@@ -672,18 +755,28 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, 
     return output
 
 
-def strip_optimizer(f='weights/best.pt', s=''):  # from utils.general import *; strip_optimizer()
-    # Strip optimizer from 'f' to finalize training, optionally save as 's'
+def strip_optimizer(f='weights/best.pt'):  # from utils.utils import *; strip_optimizer()
+    # Strip optimizer from *.pt files for lighter files (reduced by 1/2 size)
     x = torch.load(f, map_location=torch.device('cpu'))
+    x['optimizer'] = None
+    x['model'].half()  # to FP16
+    torch.save(x, f)
+    print('Optimizer stripped from %s' % f)
+
+
+def create_pretrained(f='weights/best.pt', s='weights/pretrained.pt'):  # from utils.utils import *; create_pretrained()
+    # create pretrained checkpoint 's' from 'f' (create_pretrained(x, x) for x in glob.glob('./*.pt'))
+    device = torch.device('cpu')
+    x = torch.load(s, map_location=device)
+
     x['optimizer'] = None
     x['training_results'] = None
     x['epoch'] = -1
     x['model'].half()  # to FP16
     for p in x['model'].parameters():
-        p.requires_grad = False
-    torch.save(x, s or f)
-    mb = os.path.getsize(s or f) / 1E6  # filesize
-    print('Optimizer stripped from %s,%s %.1fMB' % (f, (' saved as %s,' % s) if s else '', mb))
+        p.requires_grad = True
+    torch.save(x, s)
+    print('%s saved as pretrained checkpoint %s' % (f, s))
 
 
 def coco_class_count(path='../coco/labels/train2014/'):
@@ -697,7 +790,7 @@ def coco_class_count(path='../coco/labels/train2014/'):
         print(i, len(files))
 
 
-def coco_only_people(path='../coco/labels/train2017/'):  # from utils.general import *; coco_only_people()
+def coco_only_people(path='../coco/labels/train2017/'):  # from utils.utils import *; coco_only_people()
     # Find images with only people
     files = sorted(glob.glob('%s/*.*' % path))
     for i, file in enumerate(files):
@@ -706,7 +799,7 @@ def coco_only_people(path='../coco/labels/train2017/'):  # from utils.general im
             print(labels.shape[0], file)
 
 
-def crop_images_random(path='../images/', scale=0.50):  # from utils.general import *; crop_images_random()
+def crop_images_random(path='../images/', scale=0.50):  # from utils.utils import *; crop_images_random()
     # crops images into random squares up to scale fraction
     # WARNING: overwrites images!
     for file in tqdm(sorted(glob.glob('%s/*.*' % path))):
@@ -730,7 +823,7 @@ def crop_images_random(path='../images/', scale=0.50):  # from utils.general imp
 
 
 def coco_single_class_labels(path='../coco/labels/train2014/', label_class=43):
-    # Makes single-class coco datasets. from utils.general import *; coco_single_class_labels()
+    # Makes single-class coco datasets. from utils.utils import *; coco_single_class_labels()
     if os.path.exists('new/'):
         shutil.rmtree('new/')  # delete output folder
     os.makedirs('new/')  # make new output folder
@@ -765,7 +858,7 @@ def kmean_anchors(path='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen=10
             k: kmeans evolved anchors
 
         Usage:
-            from utils.general import *; _ = kmean_anchors()
+            from utils.utils import *; _ = kmean_anchors()
     """
     thr = 1. / thr
 
@@ -803,13 +896,14 @@ def kmean_anchors(path='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen=10
     wh0 = np.concatenate([l[:, 3:5] * s for s, l in zip(shapes, dataset.labels)])  # wh
 
     # Filter
-    i = (wh0 < 3.0).any(1).sum()
+    i = (wh0 < 4.0).any(1).sum()
     if i:
         print('WARNING: Extremely small objects found. '
-              '%g of %g labels are < 3 pixels in width or height.' % (i, len(wh0)))
-    wh = wh0[(wh0 >= 2.0).any(1)]  # filter > 2 pixels
+              '%g of %g labels are < 4 pixels in width or height.' % (i, len(wh0)))
+    wh = wh0[(wh0 >= 4.0).any(1)]  # filter > 2 pixels
 
     # Kmeans calculation
+    from scipy.cluster.vq import kmeans
     print('Running kmeans for %g anchors on %g points...' % (n, len(wh)))
     s = wh.std(0)  # sigmas for whitening
     k, dist = kmeans(wh / s, n, iter=30)  # points, mean distance
@@ -850,11 +944,11 @@ def kmean_anchors(path='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen=10
     return print_results(k)
 
 
-def print_mutation(hyp, results, yaml_file='hyp_evolved.yaml', bucket=''):
+def print_mutation(hyp, results, bucket=''):
     # Print mutation results to evolve.txt (for use with train.py --evolve)
     a = '%10s' * len(hyp) % tuple(hyp.keys())  # hyperparam keys
     b = '%10.3g' * len(hyp) % tuple(hyp.values())  # hyperparam values
-    c = '%10.4g' * len(results) % results  # results (P, R, mAP@0.5, mAP@0.5:0.95, val_losses x 3)
+    c = '%10.4g' * len(results) % results  # results (P, R, mAP, F1, test_loss)
     print('\n%s\n%s\nEvolved fitness: %s\n' % (a, b, c))
 
     if bucket:
@@ -863,20 +957,10 @@ def print_mutation(hyp, results, yaml_file='hyp_evolved.yaml', bucket=''):
     with open('evolve.txt', 'a') as f:  # append result
         f.write(c + b + '\n')
     x = np.unique(np.loadtxt('evolve.txt', ndmin=2), axis=0)  # load unique rows
-    x = x[np.argsort(-fitness(x))]  # sort
-    np.savetxt('evolve.txt', x, '%10.3g')  # save sort by fitness
-
-    # Save yaml
-    for i, k in enumerate(hyp.keys()):
-        hyp[k] = float(x[0, i + 7])
-    with open(yaml_file, 'w') as f:
-        results = tuple(x[0, :7])
-        c = '%10.4g' * len(results) % results  # results (P, R, mAP@0.5, mAP@0.5:0.95, val_losses x 3)
-        f.write('# Hyperparameter Evolution Results\n# Generations: %g\n# Metrics: ' % len(x) + c + '\n\n')
-        yaml.dump(hyp, f, sort_keys=False)
+    np.savetxt('evolve.txt', x[np.argsort(-fitness(x))], '%10.3g')  # save sort by fitness
 
     if bucket:
-        os.system('gsutil cp evolve.txt %s gs://%s' % (yaml_file, bucket))  # upload
+        os.system('gsutil cp evolve.txt gs://%s' % bucket)  # upload evolve.txt
 
 
 def apply_classifier(x, model, img, im0):
@@ -921,7 +1005,10 @@ def fitness(x):
 
 
 def output_to_target(output, width, height):
-    # Convert model output to target format [batch_id, class_id, x, y, w, h, conf]
+    """
+    Convert a YOLO model output to target format
+    [batch_id, class_id, x, y, w, h, conf]
+    """
     if isinstance(output, torch.Tensor):
         output = output.cpu().numpy()
 
@@ -942,26 +1029,7 @@ def output_to_target(output, width, height):
     return np.array(targets)
 
 
-def increment_dir(dir, comment=''):
-    # Increments a directory runs/exp1 --> runs/exp2_comment
-    n = 0  # number
-    dir = str(Path(dir))  # os-agnostic
-    d = sorted(glob.glob(dir + '*'))  # directories
-    if len(d):
-        n = max([int(x[len(dir):x.find('_') if '_' in x else None]) for x in d]) + 1  # increment
-    return dir + str(n) + ('_' + comment if comment else '')
-
-
 # Plotting functions ---------------------------------------------------------------------------------------------------
-def hist2d(x, y, n=100):
-    # 2d histogram used in labels.png and evolve.png
-    xedges, yedges = np.linspace(x.min(), x.max(), n), np.linspace(y.min(), y.max(), n)
-    hist, xedges, yedges = np.histogram2d(x, y, (xedges, yedges))
-    xidx = np.clip(np.digitize(x, xedges) - 1, 0, hist.shape[0] - 1)
-    yidx = np.clip(np.digitize(y, yedges) - 1, 0, hist.shape[1] - 1)
-    return np.log(hist[xidx, yidx])
-
-
 def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
     # https://stackoverflow.com/questions/28536191/how-to-filter-smooth-with-scipy-numpy
     def butter_lowpass(cutoff, fs, order):
@@ -988,7 +1056,7 @@ def plot_one_box(x, img, color=None, label=None, line_thickness=None):
         cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
 
 
-def plot_wh_methods():  # from utils.general import *; plot_wh_methods()
+def plot_wh_methods():  # from utils.utils import *; plot_wh_methods()
     # Compares the two methods for width-height anchor multiplication
     # https://github.com/ultralytics/yolov3/issues/168
     x = np.arange(-4.0, 4.0, .1)
@@ -996,14 +1064,13 @@ def plot_wh_methods():  # from utils.general import *; plot_wh_methods()
     yb = torch.sigmoid(torch.from_numpy(x)).numpy() * 2
 
     fig = plt.figure(figsize=(6, 3), dpi=150)
-    plt.plot(x, ya, '.-', label='YOLOv3')
-    plt.plot(x, yb ** 2, '.-', label='YOLOv5 ^2')
-    plt.plot(x, yb ** 1.6, '.-', label='YOLOv5 ^1.6')
+    plt.plot(x, ya, '.-', label='yolo method')
+    plt.plot(x, yb ** 2, '.-', label='^2 power method')
+    plt.plot(x, yb ** 2.5, '.-', label='^2.5 power method')
     plt.xlim(left=-4, right=4)
     plt.ylim(bottom=0, top=6)
     plt.xlabel('input')
     plt.ylabel('output')
-    plt.grid()
     plt.legend()
     fig.tight_layout()
     fig.savefig('comparison.png', dpi=200)
@@ -1092,7 +1159,7 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
     return mosaic
 
 
-def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
+def plot_lr_scheduler(optimizer, scheduler, epochs=300):
     # Plot LR simulating training for full epochs
     optimizer, scheduler = copy(optimizer), copy(scheduler)  # do not modify originals
     y = []
@@ -1106,10 +1173,10 @@ def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
     plt.xlim(0, epochs)
     plt.ylim(0)
     plt.tight_layout()
-    plt.savefig(Path(save_dir) / 'LR.png', dpi=200)
+    plt.savefig('LR.png', dpi=200)
 
 
-def plot_test_txt():  # from utils.general import *; plot_test()
+def plot_test_txt():  # from utils.utils import *; plot_test()
     # Plot test.txt histograms
     x = np.loadtxt('test.txt', dtype=np.float32)
     box = xyxy2xywh(x[:, :4])
@@ -1126,7 +1193,7 @@ def plot_test_txt():  # from utils.general import *; plot_test()
     plt.savefig('hist1d.png', dpi=200)
 
 
-def plot_targets_txt():  # from utils.general import *; plot_targets_txt()
+def plot_targets_txt():  # from utils.utils import *; plot_targets_txt()
     # Plot targets.txt histograms
     x = np.loadtxt('targets.txt', dtype=np.float32).T
     s = ['x targets', 'y targets', 'width targets', 'height targets']
@@ -1139,13 +1206,13 @@ def plot_targets_txt():  # from utils.general import *; plot_targets_txt()
     plt.savefig('targets.jpg', dpi=200)
 
 
-def plot_study_txt(f='study.txt', x=None):  # from utils.general import *; plot_study_txt()
+def plot_study_txt(f='study.txt', x=None):  # from utils.utils import *; plot_study_txt()
     # Plot study.txt generated by test.py
     fig, ax = plt.subplots(2, 4, figsize=(10, 6), tight_layout=True)
     ax = ax.ravel()
 
     fig2, ax2 = plt.subplots(1, 1, figsize=(8, 4), tight_layout=True)
-    for f in ['study/study_coco_yolov5%s.txt' % x for x in ['s', 'm', 'l', 'x']]:
+    for f in ['coco_study/study_coco_yolov5%s.txt' % x for x in ['s', 'm', 'l', 'x']]:
         y = np.loadtxt(f, dtype=np.float32, usecols=[0, 1, 2, 3, 7, 8, 9], ndmin=2).T
         x = np.arange(y.shape[1]) if x is None else np.array(x)
         s = ['P', 'R', 'mAP@.5', 'mAP@.5:.95', 't_inference (ms/img)', 't_NMS (ms/img)', 't_total (ms/img)']
@@ -1157,7 +1224,7 @@ def plot_study_txt(f='study.txt', x=None):  # from utils.general import *; plot_
         ax2.plot(y[6, :j], y[3, :j] * 1E2, '.-', linewidth=2, markersize=8,
                  label=Path(f).stem.replace('study_coco_', '').replace('yolo', 'YOLO'))
 
-    ax2.plot(1E3 / np.array([209, 140, 97, 58, 35, 18]), [34.6, 40.5, 43.0, 47.5, 49.7, 51.5],
+    ax2.plot(1E3 / np.array([209, 140, 97, 58, 35, 18]), [33.5, 39.1, 42.5, 45.9, 49., 50.5],
              'k.-', linewidth=2, markersize=8, alpha=.25, label='EfficientDet')
 
     ax2.grid()
@@ -1168,17 +1235,23 @@ def plot_study_txt(f='study.txt', x=None):  # from utils.general import *; plot_
     ax2.set_ylabel('COCO AP val')
     ax2.legend(loc='lower right')
     plt.savefig('study_mAP_latency.png', dpi=300)
-    plt.savefig(f.replace('.txt', '.png'), dpi=300)
+    plt.savefig(f.replace('.txt', '.png'), dpi=200)
 
 
-def plot_labels(labels, save_dir=''):
+def plot_labels(labels):
     # plot dataset labels
-    c, b = labels[:, 0], labels[:, 1:].transpose()  # classes, boxes
-    nc = int(c.max() + 1)  # number of classes
+    c, b = labels[:, 0], labels[:, 1:].transpose()  # classees, boxes
+
+    def hist2d(x, y, n=100):
+        xedges, yedges = np.linspace(x.min(), x.max(), n), np.linspace(y.min(), y.max(), n)
+        hist, xedges, yedges = np.histogram2d(x, y, (xedges, yedges))
+        xidx = np.clip(np.digitize(x, xedges) - 1, 0, hist.shape[0] - 1)
+        yidx = np.clip(np.digitize(y, yedges) - 1, 0, hist.shape[1] - 1)
+        return np.log(hist[xidx, yidx])
 
     fig, ax = plt.subplots(2, 2, figsize=(8, 8), tight_layout=True)
     ax = ax.ravel()
-    ax[0].hist(c, bins=np.linspace(0, nc, nc + 1) - 0.5, rwidth=0.8)
+    ax[0].hist(c, bins=int(c.max() + 1))
     ax[0].set_xlabel('classes')
     ax[1].scatter(b[0], b[1], c=hist2d(b[0], b[1], 90), cmap='jet')
     ax[1].set_xlabel('x')
@@ -1186,35 +1259,30 @@ def plot_labels(labels, save_dir=''):
     ax[2].scatter(b[2], b[3], c=hist2d(b[2], b[3], 90), cmap='jet')
     ax[2].set_xlabel('width')
     ax[2].set_ylabel('height')
-    plt.savefig(Path(save_dir) / 'labels.png', dpi=200)
+    plt.savefig('labels.png', dpi=200)
     plt.close()
 
 
-def plot_evolution(yaml_file='data/hyp.finetune.yaml'):  # from utils.general import *; plot_evolution()
+def plot_evolution_results(hyp):  # from utils.utils import *; plot_evolution_results(hyp)
     # Plot hyperparameter evolution results in evolve.txt
-    with open(yaml_file) as f:
-        hyp = yaml.load(f, Loader=yaml.FullLoader)
     x = np.loadtxt('evolve.txt', ndmin=2)
     f = fitness(x)
     # weights = (f - f.min()) ** 2  # for weighted results
-    plt.figure(figsize=(10, 10), tight_layout=True)
+    plt.figure(figsize=(12, 10), tight_layout=True)
     matplotlib.rc('font', **{'size': 8})
     for i, (k, v) in enumerate(hyp.items()):
         y = x[:, i + 7]
         # mu = (y * weights).sum() / weights.sum()  # best weighted result
         mu = y[f.argmax()]  # best single result
-        plt.subplot(5, 5, i + 1)
-        plt.scatter(y, f, c=hist2d(y, f, 20), cmap='viridis', alpha=.8, edgecolors='none')
-        plt.plot(mu, f.max(), 'k+', markersize=15)
+        plt.subplot(4, 5, i + 1)
+        plt.plot(mu, f.max(), 'o', markersize=10)
+        plt.plot(y, f, '.')
         plt.title('%s = %.3g' % (k, mu), fontdict={'size': 9})  # limit to 40 characters
-        if i % 5 != 0:
-            plt.yticks([])
         print('%15s: %.3g' % (k, mu))
     plt.savefig('evolve.png', dpi=200)
-    print('\nPlot saved as evolve.png')
 
 
-def plot_results_overlay(start=0, stop=0):  # from utils.general import *; plot_results_overlay()
+def plot_results_overlay(start=0, stop=0):  # from utils.utils import *; plot_results_overlay()
     # Plot training 'results*.txt', overlaying train and val losses
     s = ['train', 'train', 'train', 'Precision', 'mAP@0.5', 'val', 'val', 'val', 'Recall', 'mAP@0.5:0.95']  # legends
     t = ['GIoU', 'Objectness', 'Classification', 'P-R', 'mAP-F1']  # titles
@@ -1237,21 +1305,17 @@ def plot_results_overlay(start=0, stop=0):  # from utils.general import *; plot_
         fig.savefig(f.replace('.txt', '.png'), dpi=200)
 
 
-def plot_results(start=0, stop=0, bucket='', id=(), labels=(),
-                 save_dir=''):  # from utils.general import *; plot_results()
+def plot_results(start=0, stop=0, bucket='', id=(), labels=()):  # from utils.utils import *; plot_results()
     # Plot training 'results*.txt' as seen in https://github.com/ultralytics/yolov5#reproduce-our-training
     fig, ax = plt.subplots(2, 5, figsize=(12, 6))
     ax = ax.ravel()
     s = ['GIoU', 'Objectness', 'Classification', 'Precision', 'Recall',
          'val GIoU', 'val Objectness', 'val Classification', 'mAP@0.5', 'mAP@0.5:0.95']
     if bucket:
-        # os.system('rm -rf storage.googleapis.com')
-        # files = ['https://storage.googleapis.com/%s/results%g.txt' % (bucket, x) for x in id]
-        files = ['results%g.txt' % x for x in id]
-        c = ('gsutil cp ' + '%s ' * len(files) + '.') % tuple('gs://%s/results%g.txt' % (bucket, x) for x in id)
-        os.system(c)
+        os.system('rm -rf storage.googleapis.com')
+        files = ['https://storage.googleapis.com/%s/results%g.txt' % (bucket, x) for x in id]
     else:
-        files = glob.glob(str(Path(save_dir) / 'results*.txt')) + glob.glob('../../Downloads/results*.txt')
+        files = glob.glob('results*.txt') + glob.glob('../../Downloads/results*.txt')
     for fi, f in enumerate(files):
         try:
             results = np.loadtxt(f, usecols=[2, 3, 4, 8, 9, 12, 13, 14, 10, 11], ndmin=2).T
@@ -1263,13 +1327,13 @@ def plot_results(start=0, stop=0, bucket='', id=(), labels=(),
                     y[y == 0] = np.nan  # dont show zero loss values
                     # y /= y[0]  # normalize
                 label = labels[fi] if len(labels) else Path(f).stem
-                ax[i].plot(x, y, marker='.', label=label, linewidth=1, markersize=6)
+                ax[i].plot(x, y, marker='.', label=label, linewidth=2, markersize=8)
                 ax[i].set_title(s[i])
                 # if i in [5, 6, 7]:  # share train and val loss y axes
                 #     ax[i].get_shared_y_axes().join(ax[i], ax[i - 5])
-        except Exception as e:
-            print('Warning: Plotting error for %s; %s' % (f, e))
+        except:
+            print('Warning: Plotting error for %s, skipping file' % f)
 
     fig.tight_layout()
     ax[1].legend()
-    fig.savefig(Path(save_dir) / 'results.png', dpi=200)
+    fig.savefig('results.png', dpi=200)
