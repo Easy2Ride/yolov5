@@ -1,14 +1,18 @@
 import argparse
 import os
+import platform
 import shutil
 import time
 from pathlib import Path
 
 import cv2
+import yaml
 import torch
+import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from numpy import random
 
+from models.yolo import Model
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
 from utils.general import (
@@ -16,23 +20,82 @@ from utils.general import (
     xyxy2xywh, plot_one_box, strip_optimizer, set_logging)
 from utils.torch_utils import select_device, load_classifier, time_synchronized
 
+from utils.activations import Hardswish
+from models.common import Conv
 
 def detect(save_img=False):
     out, source, weights, view_img, save_txt, imgsz = \
-        opt.save_dir, opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size
-    webcam = source.isnumeric() or source.startswith(('rtsp://', 'rtmp://', 'http://')) or source.endswith('.txt')
+        opt.output, opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size
+    webcam = source.isnumeric() or source.startswith('rtsp') or source.startswith('http') or source.endswith('.txt')
 
     # Initialize
     set_logging()
     device = select_device(opt.device)
-    if os.path.exists(out):  # output dir
-        shutil.rmtree(out)  # delete dir
-    os.makedirs(out)  # make new dir
+    if os.path.exists(out):
+        shutil.rmtree(out)  # delete output folder
+    os.makedirs(out)  # make new output folder
     half = device.type != 'cpu'  # half precision only supported on CUDA
 
     # Load model
-    model = attempt_load(weights, map_location=device)  # load FP32 model
+    # model = attempt_load(weights, map_location=device)  # load FP32 model
+    with open('data/coco128.yaml') as f:
+        data_dict = yaml.load(f, Loader=yaml.FullLoader)
+    
+    model = Model('models/yolov5s.yaml').to(device)
+    model.names = data_dict['names']
+    model = model.fuse().eval()
+    
+    ckpt = torch.load(weights, map_location=device)
+    ckpt['model'].float().fuse().eval()
+    #print({k:(v.shape, model.state_dict()[k].shape) for k, v in ckpt['model'].float().state_dict().items()
+    #                         if model.state_dict()[k].shape != v.shape})
+                             
+    #print({k:(v.shape, ckpt['model'].float().state_dict()[k].shape) for k, v in model.state_dict().items()
+    #                         if ckpt['model'].float().state_dict()[k].shape != v.shape})
+                             
+    ckpt['model'] = {k: v for k, v in ckpt['model'].float().state_dict().items()
+                             if model.state_dict()[k].shape == v.shape}
+    model.load_state_dict(ckpt['model'], strict=False)
+    
+    for k, m in model.named_modules():
+        m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatability
+        if isinstance(m, Conv) and isinstance(m.act, nn.Hardswish):
+            m.act = Hardswish() 
+
     imgsz = check_img_size(imgsz, s=model.stride.max())  # check img_size
+    imgsz = (256, 416)
+
+    # Try exporting to onnx
+    x = torch.zeros((1, 3,  imgsz[0], imgsz[1])).to(device)
+    y = model(x)
+    print(len(y))
+    
+    print(y[0].shape)
+    
+    print(y[0].shape)
+    #make_dot(y[0]).render("attached", format="png")
+    save_path = 'yolov5s.onnx'
+    
+    
+    input_names = ["image_input" ]
+    output_names = [ "bbox_out"]
+    
+    print("Saving onnx file to {} ...".format(save_path))
+    torch_out = torch.onnx._export(model,                   # model being run
+                                   x,                       # model input (or a tuple for multiple inputs)
+                                   save_path,               # where to save the model (can be a file or file-like object)
+                                   export_params=True,      # store the trained parameter weights inside the model file
+                                   do_constant_folding=True,
+                                   #opset_version=10,
+                                   input_names = input_names, 
+                                   output_names = output_names,
+                                   keep_initializers_as_inputs = True
+                                   )
+
+
+    model.model[0].onnx_flag = False                                   
+    model.model[-1].onnx_flag = False
+    
     if half:
         model.half()  # to FP16
 
@@ -59,7 +122,7 @@ def detect(save_img=False):
 
     # Run inference
     t0 = time.time()
-    img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
+    img = torch.zeros((1, 3, imgsz[0], imgsz[1]), device=device)  # init img
     _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
     for path, img, im0s, vid_cap in dataset:
         img = torch.from_numpy(img).to(device)
@@ -70,7 +133,10 @@ def detect(save_img=False):
 
         # Inference
         t1 = time_synchronized()
-        pred = model(img, augment=opt.augment)[0]
+        for _ in range(3):
+            start = time_synchronized()
+            pred = model(img, augment=opt.augment)[0]
+            print(time_synchronized() - start)
 
         # Apply NMS
         pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
@@ -104,9 +170,8 @@ def detect(save_img=False):
                 for *xyxy, conf, cls in reversed(det):
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        line = (cls, conf, *xywh) if opt.save_conf else (cls, *xywh)  # label format
                         with open(txt_path + '.txt', 'a') as f:
-                            f.write(('%g ' * len(line) + '\n') % line)
+                            f.write(('%g ' * 5 + '\n') % (cls, *xywh))  # label format
 
                     if save_img or view_img:  # Add bbox to image
                         label = '%s %.2f' % (names[int(cls)], conf)
@@ -140,22 +205,23 @@ def detect(save_img=False):
 
     if save_txt or save_img:
         print('Results saved to %s' % Path(out))
+        if platform.system() == 'Darwin' and not opt.update:  # MacOS
+            os.system('open ' + save_path)
 
     print('Done. (%.3fs)' % (time.time() - t0))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
+    parser.add_argument('--weights', nargs='+', type=str, default='weights/yolov5s.pt', help='model.pt path(s)')
     parser.add_argument('--source', type=str, default='inference/images', help='source')  # file/folder, 0 for webcam
+    parser.add_argument('--output', type=str, default='inference/output', help='output folder')  # output folder
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.45, help='IOU threshold for NMS')
+    parser.add_argument('--conf-thres', type=float, default=0.4, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='display results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
-    parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
-    parser.add_argument('--save-dir', type=str, default='inference/output', help='directory to save results')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --class 0, or --class 0 2 3')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
