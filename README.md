@@ -5,7 +5,7 @@ This is an unofficial fork of [yolov5](https://github.com/ultralytics/yolov5) re
     - [x] Place multi-resolution support for Detect and Focus layers through config files. 
     - [x] Replace tensor slicing ops and fix onnx compatibility issues for TensorRT 6.0.1. 
     
-  - Joint architectures of object detection, segmentation and depth estimatin
+  - Joint architectures of object detection, segmentation and depth estimation
     - [x] Create a wrapper code for loading of different modules
     - [x] Enable export to onnx for joint wrapper 
     
