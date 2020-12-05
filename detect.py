@@ -25,7 +25,7 @@ from utils.activations import Hardswish
 
 
 def export_onnx(model, device):
-    size = (256, 416)
+    size = (480, 640)
     x = torch.zeros((1, 3,  size[0], size[1])).to(device)
     y = model(x)
     print(len(y))
@@ -59,7 +59,7 @@ def export_onnx(model, device):
 def load_model(weights, device):
     # Load model
     # model = attempt_load(weights, map_location=device)  # load FP32 model
-    with open('data/coco128.yaml') as f:
+    with open('data/face_data.yaml') as f:
         data_dict = yaml.load(f, Loader=yaml.FullLoader)
     
     model = Model('models/yolov5s.yaml').to(device)
@@ -68,11 +68,11 @@ def load_model(weights, device):
     
     ckpt = torch.load(weights, map_location=device)
     ckpt['model'].float().fuse().eval()
-    #print({k:(v.shape, model.state_dict()[k].shape) for k, v in ckpt['model'].float().state_dict().items()
-    #                         if model.state_dict()[k].shape != v.shape})
+    print({k:(v.shape, model.state_dict()[k].shape) for k, v in ckpt['model'].float().state_dict().items()
+                             if model.state_dict()[k].shape != v.shape})
                              
-    #print({k:(v.shape, ckpt['model'].float().state_dict()[k].shape) for k, v in model.state_dict().items()
-    #                         if ckpt['model'].float().state_dict()[k].shape != v.shape})
+    print({k:(v.shape, ckpt['model'].float().state_dict()[k].shape) for k, v in model.state_dict().items()
+                             if ckpt['model'].float().state_dict()[k].shape != v.shape})
                              
     ckpt['model'] = {k: v for k, v in ckpt['model'].float().state_dict().items()
                              if model.state_dict()[k].shape == v.shape}
@@ -100,9 +100,9 @@ def detect(save_img=False):
     # Load model
     # model = attempt_load(weights, map_location=device)  # load FP32 model
     
+    print(weights)
     model = load_model(weights, device)
     imgsz = check_img_size(imgsz, s=model.stride.max())  # check img_size
-    
     
     # Try exporting to onnx
     export_onnx(model, device)
@@ -221,7 +221,7 @@ def detect(save_img=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
+    parser.add_argument('--weights', nargs='+', type=str, default='best.pt', help='model.pt path(s)')
     parser.add_argument('--source', type=str, default='inference/images', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
