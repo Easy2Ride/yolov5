@@ -1,6 +1,19 @@
-<a href="https://apps.apple.com/app/id1452689527" target="_blank">
-<img src="https://user-images.githubusercontent.com/26833433/82944393-f7644d80-9f4f-11ea-8b87-1a5b04f555f1.jpg" width="1000"></a>
-&nbsp
+This is an unofficial fork of [yolov5](https://github.com/ultralytics/yolov5) repo. The following is the incomplete list of changes done
+
+* Network architecture changes
+  - Multi-resolution support
+    - [x] Place multi-resolution support for Detect and Focus layers through config files. 
+    - [x] Replace tensor slicing ops and fix onnx compatibility issues for TensorRT 6.0.1. 
+    
+  - Joint architectures of object detection, segmentation and depth estimation
+    - [x] Create a wrapper code for loading of different modules
+    - [x] Enable export to onnx for joint wrapper 
+    
+
+Licence: Same as [licence for yolov5](https://github.com/ultralytics/yolov5/LICENSE)
+
+Doc from parent:
+___
 
 ![CI CPU testing](https://github.com/ultralytics/yolov5/workflows/CI%20CPU%20testing/badge.svg)
 
