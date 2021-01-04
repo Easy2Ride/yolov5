@@ -1,5 +1,7 @@
 import os
 import cv2
+import yaml
+import time
 import pickle
 import numpy as np
  
@@ -15,12 +17,12 @@ from torchsummary import summary
 from models.yolo import Model
 
 # from models.models import Darknet
-from monodepth2_api import Monodepth2
 
 from models.common import Conv
 from utils.activations import Hardswish
 
-# from pydnet import PyddepthInference, Pydnet
+# from monodepth2_api import Monodepth2
+from pydnet import PyddepthInference, Pydnet
 # from fastdepth_api import MobileNetSkipAdd
 
 device = torch.device(device='cpu' if not torch.cuda.is_available() else 'cuda:0') 
@@ -87,8 +89,8 @@ class DepthDetector(nn.Module):
         self.detect_hw = detect_hw
         self.depth_hw = depth_hw
         
-        #self.depth = PyddepthInference(mobile_version = True, my_version = False, pretrained = False)
-        self.depth = Monodepth2(pretrained, num_ch_enc, num_ch_dec, num_input_images, num_output_channels, scales, use_skips, input_size = depth_hw)
+        self.depth = PyddepthInference(enc_version="resnet18", dec_version="general", pretrained=False)
+        #self.depth = Monodepth2(pretrained, num_ch_enc, num_ch_dec, num_input_images, num_output_channels, scales, use_skips, input_size = depth_hw)
         # self.depth = MobileNetSkipAdd(output_size, pretrained, pretrained_path = mobile_encoder_path, scales = scales)
         
         # self.detector = Darknet(config_path, self.detect_hw, arch = arch, cls_act = cls_act, onnx_flag = onnx_flag, use_exp = use_exp)
@@ -135,6 +137,8 @@ if __name__ == '__main__':
     img_hw = (480, 640)
     detect_hw = (256, 416)
     depth_hw = (192, 640) #(128, 224)
+    
+    img_hw = detect_hw = depth_hw = (256, 448)
     shape = (3,) + img_hw 
     
     #config_path = 'cfg/yolov3_custom.cfg'
@@ -192,12 +196,12 @@ if __name__ == '__main__':
     
 
     # The following is for monodepth as depth estimation model   
-    loaded_dict_enc = torch.load(encoder_path, map_location=device)
+    #loaded_dict_enc = torch.load(encoder_path, map_location=device)
     # extract the height and width of image that this model was trained with
-    filtered_dict_enc = {k: v for k, v in loaded_dict_enc.items() if k in model.depth.encoder.state_dict()}
-    loaded_dict = torch.load(depth_decoder_path, map_location=device)
-    model.depth.encoder.load_state_dict(filtered_dict_enc)
-    model.depth.decoder.load_state_dict(loaded_dict)
+    #filtered_dict_enc = {k: v for k, v in loaded_dict_enc.items() if k in model.depth.encoder.state_dict()}
+    #loaded_dict = torch.load(depth_decoder_path, map_location=device)
+    #model.depth.encoder.load_state_dict(filtered_dict_enc)
+    #model.depth.decoder.load_state_dict(loaded_dict)
     
     # The following is for fastdepth as depth estimation model
     #loaded_dict_enc = torch.load(os.path.join(model_path,"fastdepth.pth"), map_location=device)
@@ -205,11 +209,11 @@ if __name__ == '__main__':
     
 
     # The following is for pydnet as depth estimation model   
-    #loaded_dict_enc = torch.load(os.path.join(model_path, "mobile_pydnet.pth"), map_location=device).state_dict()
+    loaded_dict_enc = torch.load(os.path.join(model_path, "resnet18_general_roll.pth"), map_location=device)
     #new_dict_enc = {}
     #for k,v in loaded_dict_enc.items():
     #    new_dict_enc[k.replace("module.", "")] = loaded_dict_enc[k]
-    #model.depth.load_state_dict(new_dict_enc, strict = False)
+    model.depth.load_state_dict(loaded_dict_enc, strict = False)
     
     x = torch.zeros((1,) + shape).to(device)
     #x1, x2 = Preprocess()(x)
@@ -224,12 +228,34 @@ if __name__ == '__main__':
     
     if save_onnx:
         save_path = "../combined_model_benchmark/Onnx/mono_yolo_640.onnx"
-        save_path = "mono_yolov5.onnx"
+        save_path = "pyd_yolov5.onnx"
         print("Saving onnx file to {} ...".format(save_path))
         x = torch.zeros((1,) + shape).to(device)
         input_names = ["image_input"]
         output_names = [ "bbox_output", "depth_output"]
         #output_names = [ "conv2d_bbox", "conv2d_cov/Sigmoid", "depth_output"]
+        
+        def network_to_half(model):
+            """
+            Convert model to half precision in a batchnorm-safe way.
+            """
+            def bn_to_float(module):
+                """
+                BatchNorm layers need parameters in single precision. Find all layers and convert
+                them back to float.
+                """
+                if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                    module.float()
+                for child in module.children():
+                    bn_to_float(child)
+                return module
+            return bn_to_float(model.half())
+
+        # Convert model to have
+        # model = network_to_half(model)
+        #model = model.half()
+        #x = x.half()
+                
         torch_out = torch.onnx._export(model,                       # model being run
                                        x,                           # model input (or a tuple for multiple inputs)
                                        save_path,                   # where to save the model (can be a file or file-like object)

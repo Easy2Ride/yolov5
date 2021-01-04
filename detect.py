@@ -25,7 +25,7 @@ from utils.activations import Hardswish
 
 
 def export_onnx(model, device):
-    size = (480, 640)
+    size = (256, 448)
     x = torch.zeros((1, 3,  size[0], size[1])).to(device)
     y = model(x)
     print(len(y))
