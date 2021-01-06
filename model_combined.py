@@ -11,7 +11,6 @@ import torch.nn.functional as F
 #from torchviz import make_dot
 from torchsummary import summary
 
-
 #from utils.utils import *
 #from utils.datasets import *
 from models.yolo import Model
@@ -19,7 +18,7 @@ from models.yolo import Model
 # from models.models import Darknet
 
 from models.common import Conv
-from utils.activations import Hardswish
+from utils.activations import Hardswish, SiLU
 
 # from monodepth2_api import Monodepth2
 from pydnet import PyddepthInference, Pydnet
@@ -185,6 +184,8 @@ if __name__ == '__main__':
         m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatability
         if isinstance(m, Conv) and isinstance(m.act, nn.Hardswish):
             m.act = Hardswish() 
+        if isinstance(m, Conv) and isinstance(m.act, nn.SiLU):
+            m.act = SiLU() 
     
     
     # Uncomment for resnet10
