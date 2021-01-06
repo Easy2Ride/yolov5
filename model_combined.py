@@ -254,7 +254,7 @@ if __name__ == '__main__':
 
         # Convert model to have
         # model = network_to_half(model)
-        #model = model.half()
+        # model = model.half()
         #x = x.half()
                 
         torch_out = torch.onnx._export(model,                       # model being run
