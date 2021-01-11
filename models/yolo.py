@@ -62,6 +62,18 @@ class Detect(nn.Module):
          
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
 
+    def set_size(self, img_hw):
+        self.img_hw = [int(img_hw[0]), int(img_hw[1])]
+        self.ny = []
+        self.nx = []      
+        for i in range(self.nl):
+            nx = int(self.img_hw[1] / self.stride[i])
+            ny = int(self.img_hw[0] / self.stride[i])
+            self.nx.append(nx)  # number x grid points
+            self.ny.append(ny)  # number y grid points
+            self.grid[i] = self._make_grid(nx, ny).to(device)
+            self._create_fillers(i, ny, nx)
+
     def _create_fillers(self, i, nx,  ny, bs = 1, dtype = torch.half):
         filler1 = torch.zeros((bs, self.na, ny * nx, 2), device = device, dtype = dtype)
         filler2 = torch.zeros((bs, self.na, ny * nx, 1 + self.nc), device = device, dtype = dtype)
