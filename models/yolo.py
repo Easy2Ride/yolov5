@@ -62,6 +62,19 @@ class Detect(nn.Module):
          
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
 
+    def set_size(self, img_hw):
+        self.img_hw = [int(img_hw[0]), int(img_hw[1])]
+        self.ny = []
+        self.nx = []
+        for i in range(self.nl):
+            nx = int(self.img_hw[1] / self.stride[i])
+            ny = int(self.img_hw[0] / self.stride[i])
+            self.nx.append(nx)  # number x grid points
+            self.ny.append(ny)  # number y grid points
+            self.grid[i] = self._make_grid(nx, ny).to(device)
+            self._create_fillers(i, ny, nx)
+        
+        
     def _create_fillers(self, i, nx,  ny, bs = 1, dtype = torch.half):
         filler1 = torch.zeros((bs, self.na, ny * nx, 2), device = device, dtype = dtype)
         filler2 = torch.zeros((bs, self.na, ny * nx, 1 + self.nc), device = device, dtype = dtype)
@@ -133,7 +146,7 @@ class Detect(nn.Module):
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
         
 class Model(nn.Module):
-    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None):  # model, input channels, number of classes
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, device=device):  # model, input channels, number of classes
         super(Model, self).__init__()
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
@@ -150,6 +163,7 @@ class Model(nn.Module):
             self.yaml['nc'] = nc  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
+        self.model.to(device)
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
         # Build strides, anchors
@@ -158,7 +172,7 @@ class Model(nn.Module):
             s = 128  # 2x min stride
             
             # Custom stride computation
-            m.stride = torch.tensor([m.img_hw[1] / x.shape[-2] for x in self.forward(torch.zeros(1, ch, m.img_hw[0], m.img_hw[1]))])  # forward
+            m.stride = torch.tensor([m.img_hw[1] / x.shape[-2] for x in self.forward(torch.zeros(1, ch, m.img_hw[0], m.img_hw[1]).to(device))]).to(device)  # forward
             # m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             
             m.anchors /= m.stride.view(-1, 1, 1)
