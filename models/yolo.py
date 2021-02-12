@@ -126,10 +126,10 @@ class Detect(nn.Module):
                 #y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 
                 
-                if self.onnx_flag:
-                    y = y.view(bs, -1)
-                else:   
-                    y = y.view(bs, -1, self.no)
+                #if self.onnx_flag:
+                #    y = y.view(bs, -1)
+                #else:   
+                y = y.view(bs, -1, self.no)
                 z.append(y)
 
         if self.training:
